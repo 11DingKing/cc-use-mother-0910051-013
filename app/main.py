@@ -2,10 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import engine, Base
+from app.database import engine, Base, run_migrations
 from app.routers import staff, themes, venues, schools, sessions, reviews, warnings, statistics, changes, ranking
 
 Base.metadata.create_all(bind=engine)
+run_migrations()
 
 app = FastAPI(
     title=settings.APP_NAME,

@@ -355,12 +355,22 @@ class PointRecord(Base):
     points = Column(Integer, nullable=False)
     balance_after = Column(Integer, nullable=False)
     description = Column(Text)
+    # 业务事实发生时间（积分归属月份的依据）；历史数据由迁移回填
+    occurred_at = Column(DateTime(timezone=True))
+    # 幂等键：同一业务事实的重复请求不会重复计入
+    idempotency_key = Column(String(100), index=True)
+    # 更正关系：本记录更正了哪条历史记录
+    corrects_record_id = Column(Integer, ForeignKey("point_records.id"))
+    # 是否已被后续更正记录取代（被取代的记录不再计入任何统计）
+    is_superseded = Column(Boolean, default=False)
+    # 处理时间（审计用途，不参与月度归属）
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     staff = relationship("Staff", back_populates="point_records")
     session = relationship("Session")
     review = relationship("Review")
     level_badge = relationship("LevelBadge", back_populates="point_records")
+    corrected_record = relationship("PointRecord", remote_side=[id])
 
 
 class MonthlyRanking(Base):
@@ -376,6 +386,8 @@ class MonthlyRanking(Base):
     session_count = Column(Integer, nullable=False)
     is_excellent = Column(Boolean, default=False)
     level_badge_id = Column(Integer, ForeignKey("level_badges.id"))
+    # 结算版本：首次结算为1，每次重算递增
+    version = Column(Integer, default=1)
     settled_at = Column(DateTime(timezone=True), server_default=func.now())
 
     staff = relationship("Staff", back_populates="monthly_rankings")

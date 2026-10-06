@@ -1172,9 +1172,67 @@ def calculate_service_points(duration_hours: float, rating: int) -> int:
     return max(0, base_points + max(0, rating_bonus))
 
 
+def _add_months(year: int, month: int, offset: int) -> Tuple[int, int]:
+    total = year * 12 + (month - 1) + offset
+    return total // 12, total % 12 + 1
+
+
+def _month_range(year: int, month: int) -> Tuple[datetime, datetime]:
+    start_date = datetime(year, month, 1)
+    end_year, end_month = _add_months(year, month, 1)
+    end_date = datetime(end_year, end_month, 1) - timedelta(seconds=1)
+    return start_date, end_date
+
+
+def _excellent_until(year: int, month: int) -> datetime:
+    end_year, end_month = _add_months(year, month, 2)
+    return datetime(end_year, end_month, 1)
+
+
+def _resolve_occurred_at(db: Session, session_id: Optional[int],
+                         occurred_at: Optional[datetime]) -> datetime:
+    """确定积分的业务事实时间：显式指定 > 关联场次结束时间 > 当前处理时间"""
+    if occurred_at is not None:
+        if occurred_at.tzinfo is not None:
+            occurred_at = occurred_at.astimezone().replace(tzinfo=None)
+        return occurred_at
+    if session_id:
+        session = db.query(Session).filter(Session.id == session_id).first()
+        if session and session.end_time:
+            return session.end_time
+    return datetime.now()
+
+
+def _build_idempotency_key(staff_id: int, source_type: PointSourceType,
+                           session_id: Optional[int], review_id: Optional[int],
+                           idempotency_key: Optional[str]) -> Optional[str]:
+    if idempotency_key:
+        return idempotency_key
+    if review_id:
+        return f"review:{review_id}:{staff_id}"
+    if source_type == PointSourceType.SERVICE and session_id:
+        return f"service:{staff_id}:{session_id}"
+    return None
+
+
+def _is_month_settled(db: Session, year: int, month: int) -> bool:
+    return db.query(MonthlyRanking).filter(
+        MonthlyRanking.year == year,
+        MonthlyRanking.month == month
+    ).first() is not None
+
+
+def get_settled_month_pairs(db: Session) -> set:
+    """已结算的 (year, month) 集合，用于解释积分归属的月度结果状态"""
+    return {(r.year, r.month) for r in db.query(MonthlyRanking.year, MonthlyRanking.month).all()}
+
+
 def add_points(db: Session, staff_id: int, points: int, source_type: PointSourceType,
                session_id: Optional[int] = None, review_id: Optional[int] = None,
-               description: Optional[str] = None) -> schemas.PointChangeResult:
+               description: Optional[str] = None,
+               occurred_at: Optional[datetime] = None,
+               idempotency_key: Optional[str] = None,
+               correct_record_id: Optional[int] = None) -> schemas.PointChangeResult:
     staff = get_staff(db, staff_id)
     if not staff:
         return schemas.PointChangeResult(
@@ -1185,8 +1243,89 @@ def add_points(db: Session, staff_id: int, points: int, source_type: PointSource
             message="人员不存在"
         )
 
+    if session_id and not db.query(Session).filter(Session.id == session_id).first():
+        return schemas.PointChangeResult(
+            success=False,
+            staff_id=staff_id,
+            points_added=0,
+            new_balance=staff.total_points or 0,
+            message="关联场次不存在"
+        )
+
+    corrected_record = None
+    if correct_record_id is not None:
+        corrected_record = db.query(PointRecord).filter(PointRecord.id == correct_record_id).first()
+        if not corrected_record:
+            return schemas.PointChangeResult(
+                success=False,
+                staff_id=staff_id,
+                points_added=0,
+                new_balance=staff.total_points or 0,
+                message="被更正的积分记录不存在"
+            )
+        if corrected_record.staff_id != staff_id:
+            return schemas.PointChangeResult(
+                success=False,
+                staff_id=staff_id,
+                points_added=0,
+                new_balance=staff.total_points or 0,
+                message="被更正的积分记录不属于该人员"
+            )
+        if corrected_record.is_superseded:
+            return schemas.PointChangeResult(
+                success=False,
+                staff_id=staff_id,
+                points_added=0,
+                new_balance=staff.total_points or 0,
+                message=f"积分记录#{correct_record_id}已被更正，不能再次更正"
+            )
+        # 更正默认沿用原记录的业务事实，保证归属月份不变
+        if occurred_at is None:
+            occurred_at = corrected_record.occurred_at or corrected_record.created_at
+        if session_id is None:
+            session_id = corrected_record.session_id
+        if review_id is None:
+            review_id = corrected_record.review_id
+        if not idempotency_key:
+            idempotency_key = corrected_record.idempotency_key
+
+    key = _build_idempotency_key(staff_id, source_type, session_id, review_id, idempotency_key)
+
+    if key:
+        existing_query = db.query(PointRecord).filter(
+            PointRecord.idempotency_key == key,
+            PointRecord.staff_id == staff_id,
+            PointRecord.is_superseded == False
+        )
+        if correct_record_id is not None:
+            existing_query = existing_query.filter(PointRecord.id != correct_record_id)
+        existing = existing_query.first()
+        if existing:
+            existing_occurred = existing.occurred_at or existing.created_at
+            settled = _is_month_settled(db, existing_occurred.year, existing_occurred.month)
+            return schemas.PointChangeResult(
+                success=True,
+                staff_id=staff_id,
+                points_added=0,
+                new_balance=staff.total_points or 0,
+                message=f"重复请求已忽略：该业务事实已计入（记录#{existing.id}），当前积分：{staff.total_points or 0}",
+                point_record_id=existing.id,
+                occurred_at=existing_occurred,
+                attributed_year=existing_occurred.year,
+                attributed_month=existing_occurred.month,
+                month_settled=settled,
+                requires_recalculation=False,
+                duplicate=True
+            )
+
+    occurred = _resolve_occurred_at(db, session_id, occurred_at)
+
     old_balance = staff.total_points or 0
-    new_balance = old_balance + points
+    delta = points
+    if corrected_record is not None:
+        corrected_record.is_superseded = True
+        delta = points - corrected_record.points
+    new_balance = old_balance + delta
     old_level = staff.current_level or 1
 
     level_badge = get_level_badge_by_points(db, new_balance)
@@ -1201,7 +1340,10 @@ def add_points(db: Session, staff_id: int, points: int, source_type: PointSource
         source_type=source_type,
         points=points,
         balance_after=new_balance,
-        description=description
+        description=description,
+        occurred_at=occurred,
+        idempotency_key=key,
+        corrects_record_id=correct_record_id
     )
     db.add(db_point)
 
@@ -1239,20 +1381,37 @@ def add_points(db: Session, staff_id: int, points: int, source_type: PointSource
 
     db.commit()
     db.refresh(staff)
+    db.refresh(db_point)
 
-    message = f"成功增加 {points} 积分，当前积分：{new_balance}"
+    settled = _is_month_settled(db, occurred.year, occurred.month)
+
+    if corrected_record is not None:
+        message = f"已更正记录#{correct_record_id}（{corrected_record.points}分→{points}分），当前积分：{new_balance}"
+    else:
+        message = f"成功增加 {points} 积分，当前积分：{new_balance}"
     if level_up:
         message += f"，恭喜升级到 {level_badge.badge_name}！"
+    message += f"，归属{occurred.year}年{occurred.month}月"
+    if settled:
+        message += "，该月榜单已结算，需重算后生效"
 
     return schemas.PointChangeResult(
         success=True,
         staff_id=staff_id,
-        points_added=points,
+        points_added=delta,
         new_balance=new_balance,
         level_up=level_up,
         new_level=new_level if level_up else None,
         new_badge=new_badge,
-        message=message
+        message=message,
+        point_record_id=db_point.id,
+        occurred_at=occurred,
+        attributed_year=occurred.year,
+        attributed_month=occurred.month,
+        month_settled=settled,
+        requires_recalculation=settled,
+        duplicate=False,
+        corrected_record_id=correct_record_id
     )
 
 
@@ -1260,6 +1419,8 @@ def get_point_records(db: Session, staff_id: Optional[int] = None,
                       session_id: Optional[int] = None,
                       start_date: Optional[datetime] = None,
                       end_date: Optional[datetime] = None,
+                      occurred_start: Optional[datetime] = None,
+                      occurred_end: Optional[datetime] = None,
                       skip: int = 0, limit: int = 100) -> List[PointRecord]:
     query = db.query(PointRecord).options(
         joinedload(PointRecord.session),
@@ -1273,6 +1434,11 @@ def get_point_records(db: Session, staff_id: Optional[int] = None,
         query = query.filter(PointRecord.created_at >= start_date)
     if end_date:
         query = query.filter(PointRecord.created_at <= end_date)
+    occurred = func.coalesce(PointRecord.occurred_at, PointRecord.created_at)
+    if occurred_start:
+        query = query.filter(occurred >= occurred_start)
+    if occurred_end:
+        query = query.filter(occurred <= occurred_end)
     return query.order_by(PointRecord.created_at.desc()).offset(skip).limit(limit).all()
 
 
@@ -1302,17 +1468,19 @@ def calculate_positive_review_rate(db: Session, staff_id: int,
 
 def calculate_monthly_points(db: Session, staff_id: int,
                              year: int, month: int) -> Tuple[int, int]:
-    start_date = datetime(year, month, 1)
-    if month == 12:
-        end_date = datetime(year + 1, 1, 1) - timedelta(seconds=1)
-    else:
-        end_date = datetime(year, month + 1, 1) - timedelta(seconds=1)
+    """按业务事实时间（occurred_at）归属统计月度积分，与处理时间无关。
 
+    被更正取代的记录（is_superseded）不再计入；扣除类积分不参与月度统计。
+    """
+    start_date, end_date = _month_range(year, month)
+
+    occurred = func.coalesce(PointRecord.occurred_at, PointRecord.created_at)
     records = db.query(PointRecord).filter(
         PointRecord.staff_id == staff_id,
-        PointRecord.created_at >= start_date,
-        PointRecord.created_at <= end_date,
-        PointRecord.source_type != PointSourceType.DEDUCTION
+        occurred >= start_date,
+        occurred <= end_date,
+        PointRecord.source_type != PointSourceType.DEDUCTION,
+        PointRecord.is_superseded == False
     ).all()
 
     total_points = sum(r.points for r in records)
@@ -1322,25 +1490,38 @@ def calculate_monthly_points(db: Session, staff_id: int,
 
 
 def settle_monthly_ranking(db: Session, year: int, month: int,
-                           top_n: int = 3) -> schemas.MonthlySettleResult:
-    start_date = datetime(year, month, 1)
-    if month == 12:
-        end_date = datetime(year + 1, 1, 1) - timedelta(seconds=1)
-    else:
-        end_date = datetime(year, month + 1, 1) - timedelta(seconds=1)
+                           top_n: int = 3, recalculate: bool = False) -> schemas.MonthlySettleResult:
+    start_date, end_date = _month_range(year, month)
 
-    existing = db.query(MonthlyRanking).filter(
+    existing_rows = db.query(MonthlyRanking).filter(
         MonthlyRanking.year == year,
         MonthlyRanking.month == month
-    ).first()
-    if existing:
-        return schemas.MonthlySettleResult(
-            success=False,
-            year=year,
-            month=month,
-            total_staff=0,
-            message=f"{year}年{month}月榜单已结算"
-        )
+    ).all()
+
+    version = 1
+    recalculated = False
+    if existing_rows:
+        if not recalculate:
+            current_version = max(r.version or 1 for r in existing_rows)
+            return schemas.MonthlySettleResult(
+                success=False,
+                year=year,
+                month=month,
+                total_staff=0,
+                version=current_version,
+                message=f"{year}年{month}月榜单已结算（第{current_version}版），如需重算请使用 recalculate=true"
+            )
+        # 重算：撤销该月上一次结算授予的优秀标记，由新结果重新评定
+        recalculated = True
+        version = max(r.version or 1 for r in existing_rows) + 1
+        excellent_window = _excellent_until(year, month)
+        db.query(Staff).filter(
+            Staff.is_excellent == True,
+            Staff.excellent_until == excellent_window
+        ).update({Staff.is_excellent: False, Staff.excellent_until: None})
+        for row in existing_rows:
+            db.delete(row)
+        db.flush()
 
     db.query(Staff).filter(
         Staff.is_excellent == True,
@@ -1369,7 +1550,7 @@ def settle_monthly_ranking(db: Session, year: int, month: int,
     ranking_data.sort(key=lambda x: (x["total_points"], x["positive_review_rate"]), reverse=True)
 
     excellent_staff = []
-    excellent_until = datetime(year, month + 2, 1) if month < 12 else datetime(year + 1, 2, 1)
+    excellent_until = _excellent_until(year, month)
 
     for idx, data in enumerate(ranking_data):
         rank = idx + 1
@@ -1384,7 +1565,8 @@ def settle_monthly_ranking(db: Session, year: int, month: int,
             positive_review_rate=data["positive_review_rate"],
             session_count=data["session_count"],
             is_excellent=is_excellent,
-            level_badge_id=data["level_badge_id"]
+            level_badge_id=data["level_badge_id"],
+            version=version
         )
         db.add(db_ranking)
 
@@ -1397,13 +1579,20 @@ def settle_monthly_ranking(db: Session, year: int, month: int,
 
     db.commit()
 
+    if recalculated:
+        message = f"已重新结算{year}年{month}月榜单（第{version}版），共{len(ranking_data)}人上榜，{len(excellent_staff)}人被评为优秀讲解员"
+    else:
+        message = f"已完成{year}年{month}月榜单结算，共{len(ranking_data)}人上榜，{len(excellent_staff)}人被评为优秀讲解员"
+
     return schemas.MonthlySettleResult(
         success=True,
         year=year,
         month=month,
         total_staff=len(ranking_data),
         excellent_staff=excellent_staff,
-        message=f"已完成{year}年{month}月榜单结算，共{len(ranking_data)}人上榜，{len(excellent_staff)}人被评为优秀讲解员"
+        message=message,
+        recalculated=recalculated,
+        version=version
     )
 
 
@@ -1543,15 +1732,17 @@ def get_point_trend(db: Session, start_date: Optional[datetime] = None,
         "month": "%Y-%m"
     }.get(period, "%Y-%m-%d")
 
+    occurred = func.coalesce(PointRecord.occurred_at, PointRecord.created_at)
     results = db.query(
-        func.strftime(period_format, PointRecord.created_at).label("date"),
+        func.strftime(period_format, occurred).label("date"),
         func.sum(PointRecord.points).label("points"),
         func.count(func.distinct(PointRecord.staff_id)).label("staff_count")
     ).filter(
-        PointRecord.created_at >= start_date,
-        PointRecord.created_at <= end_date,
-        PointRecord.source_type != PointSourceType.DEDUCTION
-    ).group_by(func.strftime(period_format, PointRecord.created_at)).order_by("date").all()
+        occurred >= start_date,
+        occurred <= end_date,
+        PointRecord.source_type != PointSourceType.DEDUCTION,
+        PointRecord.is_superseded == False
+    ).group_by(func.strftime(period_format, occurred)).order_by("date").all()
 
     return [
         schemas.PointTrendItem(
@@ -1607,11 +1798,7 @@ def get_staff_point_details(db: Session, year: Optional[int] = None,
             Assignment.staff_id == staff.id
         ).count()
 
-        start_date = datetime(year, month, 1)
-        if month == 12:
-            end_date = datetime(year + 1, 1, 1) - timedelta(seconds=1)
-        else:
-            end_date = datetime(year, month + 1, 1) - timedelta(seconds=1)
+        start_date, end_date = _month_range(year, month)
 
         positive_rate = calculate_positive_review_rate(db, staff.id, start_date, end_date)
         monthly_points, _ = calculate_monthly_points(db, staff.id, year, month)
@@ -1640,8 +1827,65 @@ def get_staff_point_details(db: Session, year: Optional[int] = None,
 
 def adjust_staff_points(db: Session, staff_id: int, points: int,
                         source_type: PointSourceType,
-                        description: str) -> schemas.PointChangeResult:
+                        description: str,
+                        session_id: Optional[int] = None,
+                        occurred_at: Optional[datetime] = None,
+                        idempotency_key: Optional[str] = None,
+                        correct_record_id: Optional[int] = None) -> schemas.PointChangeResult:
+    kwargs = dict(
+        session_id=session_id,
+        description=description,
+        occurred_at=occurred_at,
+        idempotency_key=idempotency_key,
+        correct_record_id=correct_record_id
+    )
     if points >= 0:
-        return add_points(db, staff_id, points, source_type, description=description)
+        return add_points(db, staff_id, points, source_type, **kwargs)
     else:
-        return add_points(db, staff_id, points, PointSourceType.DEDUCTION, description=description)
+        return add_points(db, staff_id, points, PointSourceType.DEDUCTION, **kwargs)
+
+
+def get_point_attribution(db: Session, record_id: int) -> Optional[schemas.PointAttribution]:
+    """解释一笔积分属于哪个服务事实、影响了哪次月度结果"""
+    record = db.query(PointRecord).options(
+        joinedload(PointRecord.session)
+    ).filter(PointRecord.id == record_id).first()
+    if not record:
+        return None
+
+    staff = get_staff(db, record.staff_id)
+    occurred = record.occurred_at or record.created_at
+
+    ranking = db.query(MonthlyRanking).filter(
+        MonthlyRanking.staff_id == record.staff_id,
+        MonthlyRanking.year == occurred.year,
+        MonthlyRanking.month == occurred.month
+    ).first()
+
+    return schemas.PointAttribution(
+        record_id=record.id,
+        staff_id=record.staff_id,
+        staff_name=staff.name if staff else "",
+        source_type=record.source_type,
+        points=record.points,
+        balance_after=record.balance_after,
+        description=record.description,
+        session_id=record.session_id,
+        session_title=record.session.title if record.session else None,
+        session_start_time=record.session.start_time if record.session else None,
+        session_end_time=record.session.end_time if record.session else None,
+        review_id=record.review_id,
+        occurred_at=occurred,
+        created_at=record.created_at,
+        idempotency_key=record.idempotency_key,
+        corrects_record_id=record.corrects_record_id,
+        is_superseded=record.is_superseded or False,
+        attributed_year=occurred.year,
+        attributed_month=occurred.month,
+        month_settled=_is_month_settled(db, occurred.year, occurred.month),
+        counted_in_monthly_result=(not record.is_superseded) and record.source_type != PointSourceType.DEDUCTION,
+        ranking_rank=ranking.rank if ranking else None,
+        ranking_total_points=ranking.total_points if ranking else None,
+        ranking_version=ranking.version if ranking else None,
+        ranking_settled_at=ranking.settled_at if ranking else None
+    )

@@ -136,17 +136,23 @@ def get_staff_points(
     staff_id: int,
     skip: int = 0,
     limit: int = 100,
-    start_date: Optional[datetime] = Query(None, description="开始日期"),
-    end_date: Optional[datetime] = Query(None, description="结束日期"),
+    start_date: Optional[datetime] = Query(None, description="处理时间起（审计口径）"),
+    end_date: Optional[datetime] = Query(None, description="处理时间止（审计口径）"),
+    occurred_start: Optional[datetime] = Query(None, description="业务发生时间起（归属口径）"),
+    occurred_end: Optional[datetime] = Query(None, description="业务发生时间止（归属口径）"),
     db: Session = Depends(get_db)
 ):
-    """获取讲解员积分记录"""
+    """获取讲解员积分记录（含业务归属与处理时间）"""
     staff = crud.get_staff(db, staff_id)
     if not staff:
         raise HTTPException(status_code=404, detail="人员不存在")
-    records = crud.get_point_records(db, staff_id=staff_id, start_date=start_date, end_date=end_date, skip=skip, limit=limit)
+    records = crud.get_point_records(db, staff_id=staff_id, start_date=start_date, end_date=end_date,
+                                     occurred_start=occurred_start, occurred_end=occurred_end,
+                                     skip=skip, limit=limit)
+    settled_pairs = crud.get_settled_month_pairs(db)
     result = []
     for r in records:
+        occurred = r.occurred_at or r.created_at
         result.append(schemas.PointRecord(
             id=r.id,
             staff_id=r.staff_id,
@@ -159,6 +165,13 @@ def get_staff_points(
             description=r.description,
             session_title=r.session.title if r.session else None,
             level_badge_name=r.level_badge.badge_name if r.level_badge else None,
+            occurred_at=occurred,
+            idempotency_key=r.idempotency_key,
+            corrects_record_id=r.corrects_record_id,
+            is_superseded=r.is_superseded or False,
+            attributed_year=occurred.year,
+            attributed_month=occurred.month,
+            month_settled=(occurred.year, occurred.month) in settled_pairs,
             created_at=r.created_at
         ))
     return result
@@ -189,18 +202,35 @@ def get_staff_badges(staff_id: int, db: Session = Depends(get_db)):
 @router.post("/{staff_id}/points", response_model=schemas.PointChangeResult)
 def adjust_staff_points(
     staff_id: int,
-    points: int = Query(..., description="调整积分（正数增加，负数扣除）"),
+    points: int = Query(..., description="调整积分（正数增加，负数扣除；更正时为更正后的积分值）"),
     source_type: str = Query("BONUS", description="积分类型：SERVICE/RATING/BONUS/DEDUCTION"),
     description: str = Query(..., description="调整原因"),
+    session_id: Optional[int] = Query(None, description="关联场次ID，补录历史服务积分时填写"),
+    occurred_at: Optional[datetime] = Query(None, description="业务发生时间，默认取关联场次结束时间或当前时间"),
+    idempotency_key: Optional[str] = Query(None, description="幂等键，同一业务事实的重复请求不会重复计入"),
+    correct_record_id: Optional[int] = Query(None, description="要更正的积分记录ID，原记录将被取代"),
     db: Session = Depends(get_db)
 ):
-    """人工调整讲解员积分"""
+    """人工调整讲解员积分
+
+    积分按业务事实时间（occurred_at）归属到对应月份：
+    - 补录历史场次：传 session_id 或 occurred_at，积分进入服务实际发生的月份；
+    - 重复提交同一业务事实（相同幂等键）不会重复计入；
+    - 更正已入账记录：传 correct_record_id，原记录被取代，差额计入归属月份；
+    - 若归属月份已结算，返回结果会提示需要重算榜单。
+    """
     from app.models import PointSourceType
     try:
         source_type_enum = PointSourceType(source_type)
     except ValueError:
-        raise HTTPException(status_code=400, detail="无效的积分类型")
-    result = crud.adjust_staff_points(db, staff_id, points, source_type_enum, description)
+        try:
+            source_type_enum = PointSourceType[source_type]
+        except KeyError:
+            raise HTTPException(status_code=400, detail="无效的积分类型")
+    result = crud.adjust_staff_points(db, staff_id, points, source_type_enum, description,
+                                      session_id=session_id, occurred_at=occurred_at,
+                                      idempotency_key=idempotency_key,
+                                      correct_record_id=correct_record_id)
     if not result.success:
         raise HTTPException(status_code=400, detail=result.message)
     return result

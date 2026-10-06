@@ -14,10 +14,15 @@ def settle_monthly_ranking(
     year: int = Query(..., description="年份"),
     month: int = Query(..., ge=1, le=12, description="月份"),
     top_n: int = Query(3, ge=1, le=10, description="优秀讲解员数量"),
+    recalculate: bool = Query(False, description="已结算月份是否重算（撤销旧结果后按当前积分重新结算）"),
     db: Session = Depends(get_db)
 ):
-    """结算月度榜单，自动标记优秀讲解员"""
-    result = crud.settle_monthly_ranking(db, year, month, top_n)
+    """结算月度榜单，自动标记优秀讲解员
+
+    榜单按积分的业务事实时间归属统计。已结算的月份默认拒绝重复结算；
+    补录或更正历史积分后，使用 recalculate=true 显式重算该月榜单。
+    """
+    result = crud.settle_monthly_ranking(db, year, month, top_n, recalculate=recalculate)
     if not result.success:
         raise HTTPException(status_code=400, detail=result.message)
     return result
@@ -46,9 +51,23 @@ def get_monthly_ranking(
             is_excellent=r.is_excellent,
             level_badge_id=r.level_badge_id,
             level_badge_name=r.level_badge.badge_name if r.level_badge else None,
+            version=r.version or 1,
             settled_at=r.settled_at
         ))
     return result
+
+
+@router.get("/point-records/{record_id}", response_model=schemas.PointAttribution)
+def get_point_record_attribution(record_id: int, db: Session = Depends(get_db)):
+    """解释一笔积分的归属：属于哪个服务事实、影响了哪次月度结果
+
+    返回业务事实（场次/评价）、业务发生时间、处理时间、归属月份，
+    以及该归属月份的榜单结算状态与上榜结果。
+    """
+    attribution = crud.get_point_attribution(db, record_id)
+    if not attribution:
+        raise HTTPException(status_code=404, detail="积分记录不存在")
+    return attribution
 
 
 @router.get("/current", response_model=List[schemas.StaffPointDetail])

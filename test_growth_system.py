@@ -178,13 +178,22 @@ def test_monthly_ranking():
     try:
         staff_list = crud.get_staff_list(db, staff_type=StaffType.GUIDE, limit=5)
 
-        print("  为前5名讲解员增加本月积分...")
+        print("  为前5名讲解员补录2026年6月服务积分（业务时间归属6月）...")
         for i, s in enumerate(staff_list):
-            crud.add_points(db, s.id, 100 + i * 80, PointSourceType.SERVICE,
-                            description=f"6月服务积分{i+1}")
+            result = crud.add_points(
+                db, s.id, 100 + i * 80, PointSourceType.SERVICE,
+                description=f"6月服务积分{i+1}",
+                occurred_at=datetime(2026, 6, 10 + i, 10, 0, 0),
+                idempotency_key=f"growth-test-202606-{s.id}"
+            )
+            assert result.attributed_year == 2026 and result.attributed_month == 6, \
+                "补录积分应归属业务发生月份"
 
         print("  结算2026年6月榜单...")
         result = crud.settle_monthly_ranking(db, 2026, 6, top_n=3)
+        if not result.success and "已结算" in result.message:
+            print(f"  6月榜单已结算，触发显式重算...")
+            result = crud.settle_monthly_ranking(db, 2026, 6, top_n=3, recalculate=True)
         print(f"  ✅ {result.message}")
         assert result.success, "榜单结算应该成功"
         assert result.total_staff >= 5, "上榜人数应该不少于5人"
@@ -213,10 +222,88 @@ def test_monthly_ranking():
         db.close()
 
 
+def test_backfill_attribution():
+    """测试历史积分补录归属、幂等、更正与已结算月份重算"""
+    print("\n" + "="*60)
+    print("8. 测试历史服务积分归属（补录/幂等/更正/重算）")
+    print("="*60)
+
+    db = SessionLocal()
+    try:
+        from app.models import Session as SessionModel
+
+        june_session = db.query(SessionModel).filter(
+            SessionModel.status == SessionStatus.COMPLETED,
+            SessionModel.end_time >= datetime(2026, 6, 1),
+            SessionModel.end_time < datetime(2026, 7, 1)
+        ).first()
+        assert june_session, "需要2026年6月已完成场次作为补录对象"
+        guide_assignment = next(a for a in june_session.assignments
+                                if a.role == AssignmentRole.GUIDE)
+        staff_id = guide_assignment.staff_id
+        staff = crud.get_staff(db, staff_id)
+        print(f"  补录对象: {staff.name} - 场次「{june_session.title}」"
+              f"({june_session.end_time.strftime('%Y-%m-%d')})")
+
+        june_before, _ = crud.calculate_monthly_points(db, staff_id, 2026, 6)
+        balance_before = staff.total_points or 0
+
+        r1 = crud.add_points(db, staff_id, 30, PointSourceType.SERVICE,
+                             session_id=june_session.id, description="暑期复盘补录")
+        assert r1.success
+        assert (r1.attributed_year, r1.attributed_month) == (2026, 6), "补录应归属6月"
+        assert r1.occurred_at == june_session.end_time, "业务时间应取场次结束时间"
+        record_id = r1.point_record_id
+        if not r1.duplicate:
+            print(f"  ✅ 补录30分: 归属2026年6月（处理时间 {r1.occurred_at} 为业务时间）")
+        else:
+            print(f"  ✅ 补录幂等命中已有记录#{record_id}（重复执行不重复计入）")
+
+        r1_again = crud.add_points(db, staff_id, 30, PointSourceType.SERVICE,
+                                   session_id=june_session.id, description="暑期复盘补录")
+        assert r1_again.duplicate and r1_again.points_added == 0, "重复补录不得重复计入"
+        june_after, _ = crud.calculate_monthly_points(db, staff_id, 2026, 6)
+        expected_june = june_before + (0 if r1.duplicate else 30)
+        assert june_after == expected_june, f"6月积分应为{expected_june}，实际{june_after}"
+        assert (crud.get_staff(db, staff_id).total_points or 0) == \
+               balance_before + (0 if r1.duplicate else 30)
+        print(f"  ✅ 重复补录被忽略: 6月积分={june_after}分, 余额未重复增加")
+
+        attr = crud.get_point_attribution(db, record_id)
+        old_points = attr.points
+        r2 = crud.add_points(db, staff_id, old_points + 5, PointSourceType.SERVICE,
+                             correct_record_id=record_id, description="更正补录积分")
+        assert r2.success and r2.points_added == 5, "更正应按差额入账"
+        june_corrected, _ = crud.calculate_monthly_points(db, staff_id, 2026, 6)
+        assert june_corrected == expected_june + 5, "更正后6月积分应反映新值"
+        attr_old = crud.get_point_attribution(db, record_id)
+        assert attr_old.is_superseded and not attr_old.counted_in_monthly_result
+        attr_new = crud.get_point_attribution(db, r2.point_record_id)
+        assert attr_new.counted_in_monthly_result
+        assert (attr_new.attributed_year, attr_new.attributed_month) == (2026, 6)
+        print(f"  ✅ 更正生效: {old_points}→{old_points + 5}分, 原记录#{record_id}被取代, "
+              f"新记录#{r2.point_record_id}归属2026年6月")
+
+        if attr_new.month_settled:
+            print(f"  6月榜单已结算，验证显式重算...")
+            recalc = crud.settle_monthly_ranking(db, 2026, 6, top_n=3, recalculate=True)
+            assert recalc.success and recalc.recalculated and recalc.version >= 2
+            board = crud.get_monthly_ranking(db, 2026, 6)
+            row = next(r for r in board if r.staff_id == staff_id)
+            assert row.total_points == june_corrected, "重算后榜单应包含补录更正后的积分"
+            print(f"  ✅ 重算完成(第{recalc.version}版): {staff.name} 6月上榜积分={row.total_points}")
+        else:
+            print("  ℹ️  6月榜单尚未结算，跳过重算验证")
+
+        print("\n  ✅ 历史服务积分归属测试通过")
+    finally:
+        db.close()
+
+
 def test_recommendation_with_excellent():
     """测试优秀讲解员优先推荐"""
     print("\n" + "="*60)
-    print("8. 测试优秀讲解员优先推荐")
+    print("9. 测试优秀讲解员优先推荐")
     print("="*60)
 
     db = SessionLocal()
@@ -252,7 +339,7 @@ def test_recommendation_with_excellent():
 def test_statistics():
     """测试统计模块新功能"""
     print("\n" + "="*60)
-    print("9. 测试统计模块新功能")
+    print("10. 测试统计模块新功能")
     print("="*60)
 
     db = SessionLocal()
@@ -287,7 +374,7 @@ def test_statistics():
 def test_review_auto_points():
     """测试评价自动计算积分"""
     print("\n" + "="*60)
-    print("10. 测试评价自动计算积分")
+    print("11. 测试评价自动计算积分")
     print("="*60)
 
     db = SessionLocal()
@@ -348,6 +435,7 @@ def main():
         test_point_records,
         test_staff_badges,
         test_monthly_ranking,
+        test_backfill_attribution,
         test_recommendation_with_excellent,
         test_statistics,
         test_review_auto_points,

@@ -543,6 +543,13 @@ class PointRecord(PointRecordBase):
     balance_after: int
     session_title: Optional[str] = None
     level_badge_name: Optional[str] = None
+    occurred_at: datetime
+    idempotency_key: Optional[str] = None
+    corrects_record_id: Optional[int] = None
+    is_superseded: bool = False
+    attributed_year: int
+    attributed_month: int
+    month_settled: bool = False
     created_at: datetime
 
     class Config:
@@ -582,6 +589,7 @@ class MonthlyRanking(MonthlyRankingBase):
     staff_name: str
     level_badge_id: Optional[int] = None
     level_badge_name: Optional[str] = None
+    version: int = 1
     settled_at: datetime
 
     class Config:
@@ -607,6 +615,14 @@ class PointChangeResult(BaseModel):
     new_level: Optional[int] = None
     new_badge: Optional[LevelBadge] = None
     message: str
+    point_record_id: Optional[int] = None
+    occurred_at: Optional[datetime] = None
+    attributed_year: Optional[int] = None
+    attributed_month: Optional[int] = None
+    month_settled: bool = False
+    requires_recalculation: bool = False
+    duplicate: bool = False
+    corrected_record_id: Optional[int] = None
 
 
 class MonthlySettleResult(BaseModel):
@@ -616,6 +632,37 @@ class MonthlySettleResult(BaseModel):
     total_staff: int
     excellent_staff: List[int] = []
     message: str
+    recalculated: bool = False
+    version: int = 1
+
+
+class PointAttribution(BaseModel):
+    """一笔积分的归属解释：属于哪个服务事实、影响了哪次月度结果"""
+    record_id: int
+    staff_id: int
+    staff_name: str
+    source_type: PointSourceType
+    points: int
+    balance_after: int
+    description: Optional[str] = None
+    session_id: Optional[int] = None
+    session_title: Optional[str] = None
+    session_start_time: Optional[datetime] = None
+    session_end_time: Optional[datetime] = None
+    review_id: Optional[int] = None
+    occurred_at: datetime
+    created_at: datetime
+    idempotency_key: Optional[str] = None
+    corrects_record_id: Optional[int] = None
+    is_superseded: bool = False
+    attributed_year: int
+    attributed_month: int
+    month_settled: bool = False
+    counted_in_monthly_result: bool = True
+    ranking_rank: Optional[int] = None
+    ranking_total_points: Optional[int] = None
+    ranking_version: Optional[int] = None
+    ranking_settled_at: Optional[datetime] = None
 
 
 class PointTrendItem(BaseModel):

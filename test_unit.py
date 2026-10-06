@@ -199,7 +199,7 @@ def main():
                   f"平均处理{f.avg_resolution_time_hours:.2f}小时")
 
         test_header("11. 测试预检查功能")
-        
+
         from app.models import ChangeRequest
         temp_change = ChangeRequest(
             session_id=session.id,
@@ -212,6 +212,119 @@ def main():
         print(f"✓ 预检查结果: {len(conflicts)}个冲突, {len(suggestions)}条建议")
         for c in conflicts:
             print(f"    - [{c.conflict_type.value}] {c.message}")
+
+        test_header("12. 历史服务积分归属（补录/幂等/更正/结算重算）")
+
+        from app.models import PointSourceType
+
+        now = datetime.now()
+        # 补录月份避开当前月，模拟“十月补录六月场次”的场景
+        bf_year, bf_month = (2026, 6) if (now.year, now.month) != (2026, 6) else (2026, 5)
+
+        june_session = crud.create_session(db, schemas.SessionCreate(
+            title="六月研学场次",
+            theme_id=theme.id, venue_id=venue.id,
+            session_type=SessionType.RESEARCH,
+            start_time=datetime(bf_year, bf_month, 15, 9, 0),
+            end_time=datetime(bf_year, bf_month, 15, 11, 0),
+            audience_type=AudienceType.SCHOOL,
+            audience_count=30, school_id=school.id,
+            guides_needed=1, needs_lecturer=False
+        ))
+        crud.create_assignment(db, june_session.id, schemas.AssignmentCreate(
+            staff_id=staff2.id, role=AssignmentRole.GUIDE
+        ))
+        crud.update_session(db, june_session.id, schemas.SessionUpdate(status=SessionStatus.COMPLETED))
+        print(f"✓ 创建{bf_year}年{bf_month}月已完成场次: ID={june_session.id}")
+
+        balance_before = crud.get_staff(db, staff2.id).total_points or 0
+
+        r1 = crud.add_points(db, staff2.id, 25, PointSourceType.SERVICE,
+                             session_id=june_session.id, description="复盘补录服务积分")
+        assert r1.success and not r1.duplicate
+        assert (r1.attributed_year, r1.attributed_month) == (bf_year, bf_month), "补录积分应归属服务发生月份"
+        assert r1.occurred_at == june_session.end_time, "业务时间应取场次结束时间"
+        assert not r1.month_settled
+        print(f"✓ 补录25分: 归属{bf_year}年{bf_month}月, 业务时间={r1.occurred_at}, 处理时间保留于created_at")
+
+        month_pts, month_sessions = crud.calculate_monthly_points(db, staff2.id, bf_year, bf_month)
+        cur_pts, _ = crud.calculate_monthly_points(db, staff2.id, now.year, now.month)
+        assert month_pts == 25 and month_sessions == 1, f"归属月应为25分，实际{month_pts}"
+        assert cur_pts == 0, f"当前月不应计入补录积分，实际{cur_pts}"
+        print(f"✓ 月度归属正确: {bf_year}-{bf_month:02d}月=25分/1场, 当前月=0分（不再漂移）")
+
+        r2 = crud.add_points(db, staff2.id, 25, PointSourceType.SERVICE,
+                             session_id=june_session.id, description="重复补录同一场次")
+        assert r2.success and r2.duplicate and r2.points_added == 0
+        assert (crud.get_staff(db, staff2.id).total_points or 0) == balance_before + 25
+        month_pts, _ = crud.calculate_monthly_points(db, staff2.id, bf_year, bf_month)
+        assert month_pts == 25, "重复补录不得重复计入"
+        print(f"✓ 重复补录被幂等忽略: 余额与月度积分均未变化")
+
+        r3 = crud.add_points(db, staff2.id, 40, PointSourceType.SERVICE,
+                             correct_record_id=r1.point_record_id, description="更正补录积分")
+        assert r3.success and r3.points_added == 15, "更正应按差额入账"
+        assert (crud.get_staff(db, staff2.id).total_points or 0) == balance_before + 40
+        month_pts, _ = crud.calculate_monthly_points(db, staff2.id, bf_year, bf_month)
+        assert month_pts == 40, f"更正后归属月应为40分，实际{month_pts}"
+        attr_old = crud.get_point_attribution(db, r1.point_record_id)
+        assert attr_old.is_superseded and not attr_old.counted_in_monthly_result
+        print(f"✓ 更正生效: 25→40分, 原记录#{r1.point_record_id}被取代且不再计入")
+
+        attr = crud.get_point_attribution(db, r3.point_record_id)
+        assert attr.session_id == june_session.id and attr.session_title == "六月研学场次"
+        assert (attr.attributed_year, attr.attributed_month) == (bf_year, bf_month)
+        assert attr.counted_in_monthly_result and not attr.month_settled
+        print(f"✓ 归属解释: 记录#{attr.record_id} 属于场次「{attr.session_title}」, 归属{attr.attributed_year}年{attr.attributed_month}月")
+
+        s1 = crud.settle_monthly_ranking(db, bf_year, bf_month, top_n=3)
+        assert s1.success and not s1.recalculated and s1.version == 1
+        board = crud.get_monthly_ranking(db, bf_year, bf_month)
+        staff2_row = next(r for r in board if r.staff_id == staff2.id)
+        assert staff2_row.total_points == 40, "结算应包含补录并更正后的积分"
+        print(f"✓ {bf_year}年{bf_month}月榜单结算(第1版): {staff2.name}={staff2_row.total_points}分")
+
+        s_again = crud.settle_monthly_ranking(db, bf_year, bf_month, top_n=3)
+        assert not s_again.success, "重复结算应被拒绝"
+        print(f"✓ 重复结算被拒绝: {s_again.message}")
+
+        june_session2 = crud.create_session(db, schemas.SessionCreate(
+            title="六月第二场研学",
+            theme_id=theme.id, venue_id=venue.id,
+            session_type=SessionType.RESEARCH,
+            start_time=datetime(bf_year, bf_month, 20, 14, 0),
+            end_time=datetime(bf_year, bf_month, 20, 16, 0),
+            audience_type=AudienceType.SCHOOL,
+            audience_count=20, school_id=school.id,
+            guides_needed=1, needs_lecturer=False
+        ))
+        crud.create_assignment(db, june_session2.id, schemas.AssignmentCreate(
+            staff_id=staff2.id, role=AssignmentRole.GUIDE
+        ))
+        r4 = crud.add_points(db, staff2.id, 20, PointSourceType.SERVICE,
+                             session_id=june_session2.id, description="结算后补录第二场")
+        assert r4.month_settled and r4.requires_recalculation, "已结算月份补录应提示重算"
+        print(f"✓ 结算后补录20分: {r4.message}")
+
+        month_pts, _ = crud.calculate_monthly_points(db, staff2.id, bf_year, bf_month)
+        assert month_pts == 60, "实时统计应立即反映补录"
+        board_stale = crud.get_monthly_ranking(db, bf_year, bf_month)
+        assert next(r for r in board_stale if r.staff_id == staff2.id).total_points == 40, "已结算榜单在重算前保持不变"
+
+        s2 = crud.settle_monthly_ranking(db, bf_year, bf_month, top_n=3, recalculate=True)
+        assert s2.success and s2.recalculated and s2.version == 2
+        board2 = crud.get_monthly_ranking(db, bf_year, bf_month)
+        staff2_row2 = next(r for r in board2 if r.staff_id == staff2.id)
+        assert staff2_row2.total_points == 60 and staff2_row2.version == 2
+        print(f"✓ 显式重算(第2版): {staff2.name}={staff2_row2.total_points}分, 榜单版本={staff2_row2.version}")
+
+        attr2 = crud.get_point_attribution(db, r4.point_record_id)
+        assert attr2.month_settled and attr2.ranking_total_points == 60 and attr2.ranking_version == 2
+        print(f"✓ 归属解释(结算后): 记录#{attr2.record_id} 影响{bf_year}年{bf_month}月榜单第{attr2.ranking_version}版, 上榜积分={attr2.ranking_total_points}")
+
+        r5 = crud.add_points(db, staff2.id, 5, PointSourceType.BONUS, description="即时奖励积分")
+        assert (r5.attributed_year, r5.attributed_month) == (now.year, now.month), "普通即时积分仍归属当前月"
+        print(f"✓ 即时积分不回归: 无场次/业务时间时归属当前月")
 
         test_header("所有测试通过！功能验证完成")
         print("""
