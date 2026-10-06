@@ -543,6 +543,15 @@ class PointRecord(PointRecordBase):
     balance_after: int
     session_title: Optional[str] = None
     level_badge_name: Optional[str] = None
+    # 业务归属月（按服务事实场次时间），为空表示按处理时间归属的普通即时积分
+    service_year: Optional[int] = None
+    service_month: Optional[int] = None
+    fact_key: Optional[str] = None
+    replaces_id: Optional[int] = None
+    is_voided: bool = False
+    voided_at: Optional[datetime] = None
+    void_reason: Optional[str] = None
+    operator: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -582,7 +591,11 @@ class MonthlyRanking(MonthlyRankingBase):
     staff_name: str
     level_badge_id: Optional[int] = None
     level_badge_name: Optional[str] = None
+    top_n: int = 3
+    status: str = "已结算"
+    revision: int = 1
     settled_at: datetime
+    adjusted_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -616,6 +629,102 @@ class MonthlySettleResult(BaseModel):
     total_staff: int
     excellent_staff: List[int] = []
     message: str
+    action: str = "settled"  # settled / recalculated
+    revision: int = 1
+    changed_staff: List[int] = []
+
+
+class ServicePointBackfillRequest(BaseModel):
+    """为已完成场次补录/更正某讲解员的服务积分"""
+    staff_id: int
+    points: int = Field(ge=0, description="更正后的该场服务积分（0 表示撤销该场服务积分）")
+    operator: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class ServicePointResult(BaseModel):
+    success: bool
+    message: str
+    staff_id: int
+    session_id: int
+    points: int
+    # idempotent / corrected / created
+    action: str
+    point_record_id: Optional[int] = None
+    service_year: Optional[int] = None
+    service_month: Optional[int] = None
+    # 该笔积分影响到的月度结果（未结算则为空）
+    monthly_affected: Optional["MonthlyAffectedInfo"] = None
+    balance_after: int = 0
+
+
+class MonthlyAffectedInfo(BaseModel):
+    year: int
+    month: int
+    ranking_status: str
+    old_total_points: Optional[int] = None
+    new_total_points: Optional[int] = None
+    old_rank: Optional[int] = None
+    new_rank: Optional[int] = None
+    revision: Optional[int] = None
+    adjustment_id: Optional[int] = None
+
+
+class PointAttribution(BaseModel):
+    """一笔积分的完整归属解释"""
+    point_record_id: int
+    staff_id: int
+    staff_name: str
+    points: int
+    source_type: PointSourceType
+    description: Optional[str] = None
+    # 服务事实
+    session_id: Optional[int] = None
+    session_title: Optional[str] = None
+    session_start_time: Optional[datetime] = None
+    session_end_time: Optional[datetime] = None
+    review_id: Optional[int] = None
+    # 归属月与处理时间
+    service_year: Optional[int] = None
+    service_month: Optional[int] = None
+    attribution_basis: str  # 服务事实 / 处理时间
+    created_at: datetime
+    operator: Optional[str] = None
+    is_voided: bool = False
+    replaces_id: Optional[int] = None
+    void_reason: Optional[str] = None
+    # 影响了哪次月度结果
+    monthly_impacts: List["MonthlyImpactItem"] = []
+
+
+class MonthlyImpactItem(BaseModel):
+    year: int
+    month: int
+    ranking_status: str
+    rank: Optional[int] = None
+    total_points: Optional[int] = None
+    revision: int = 1
+    adjusted_at: Optional[datetime] = None
+
+
+class MonthlyRankingAdjustmentOut(BaseModel):
+    id: int
+    ranking_id: Optional[int]
+    year: int
+    month: int
+    staff_id: int
+    staff_name: str
+    point_record_id: Optional[int] = None
+    reason: str
+    old_total_points: Optional[int] = None
+    new_total_points: Optional[int] = None
+    old_rank: Optional[int] = None
+    new_rank: Optional[int] = None
+    operator: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class PointTrendItem(BaseModel):
@@ -639,3 +748,8 @@ class StaffPointDetail(StaffRankingItem):
     is_excellent: bool
     positive_review_rate: float
     monthly_points: int = 0
+
+
+# 解析上述模型中的前向引用（ServicePointResult -> MonthlyAffectedInfo 等）
+ServicePointResult.model_rebuild()
+PointAttribution.model_rebuild()

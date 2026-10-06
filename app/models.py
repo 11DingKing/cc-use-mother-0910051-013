@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Enum, Text
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Enum, Text, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -355,12 +355,29 @@ class PointRecord(Base):
     points = Column(Integer, nullable=False)
     balance_after = Column(Integer, nullable=False)
     description = Column(Text)
+    # 业务归属月：积分对应的服务事实（场次结束时间）所在年月。
+    # 普通即时积分（奖励/扣除）及历史既有记录为空，此时归属月退回 created_at（处理时间）。
+    service_year = Column(Integer)
+    service_month = Column(Integer)
+    # 服务事实幂等键：service:{staff_id}:{session_id}:{review_id|0}
+    fact_key = Column(String(120), unique=True)
+    # 更正链：新记录替换旧记录，旧记录 is_voided=True 保留审计，不再参与任何统计
+    replaces_id = Column(Integer, ForeignKey("point_records.id"))
+    is_voided = Column(Boolean, default=False, nullable=False)
+    voided_at = Column(DateTime(timezone=True))
+    void_reason = Column(Text)
+    operator = Column(String(100))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_point_records_service_month", "service_year", "service_month"),
+    )
 
     staff = relationship("Staff", back_populates="point_records")
     session = relationship("Session")
     review = relationship("Review")
     level_badge = relationship("LevelBadge", back_populates="point_records")
+    replaces = relationship("PointRecord", foreign_keys=[replaces_id])
 
 
 class MonthlyRanking(Base):
@@ -376,10 +393,40 @@ class MonthlyRanking(Base):
     session_count = Column(Integer, nullable=False)
     is_excellent = Column(Boolean, default=False)
     level_badge_id = Column(Integer, ForeignKey("level_badges.id"))
+    top_n = Column(Integer, default=3, nullable=False)
+    # 已结算 / 已调整
+    status = Column(String(20), default="已结算", nullable=False)
+    revision = Column(Integer, default=1, nullable=False)
     settled_at = Column(DateTime(timezone=True), server_default=func.now())
+    adjusted_at = Column(DateTime(timezone=True))
 
     staff = relationship("Staff", back_populates="monthly_rankings")
     level_badge = relationship("LevelBadge", back_populates="monthly_rankings")
+    adjustments = relationship("MonthlyRankingAdjustment", back_populates="ranking",
+                               cascade="all, delete-orphan")
+
+
+class MonthlyRankingAdjustment(Base):
+    """已结算月份的调整审计：哪笔积分、由谁、把谁的月结果从什么值改成什么值"""
+    __tablename__ = "monthly_ranking_adjustments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ranking_id = Column(Integer, ForeignKey("monthly_rankings.id"))
+    year = Column(Integer, nullable=False)
+    month = Column(Integer, nullable=False)
+    staff_id = Column(Integer, ForeignKey("staff.id"), nullable=False)
+    point_record_id = Column(Integer, ForeignKey("point_records.id"))
+    reason = Column(String(50), nullable=False)
+    old_total_points = Column(Integer)
+    new_total_points = Column(Integer)
+    old_rank = Column(Integer)
+    new_rank = Column(Integer)
+    operator = Column(String(100))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    ranking = relationship("MonthlyRanking", back_populates="adjustments")
+    staff = relationship("Staff")
+    point_record = relationship("PointRecord", foreign_keys=[point_record_id])
 
 
 class StaffBadge(Base):

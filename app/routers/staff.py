@@ -136,15 +136,19 @@ def get_staff_points(
     staff_id: int,
     skip: int = 0,
     limit: int = 100,
-    start_date: Optional[datetime] = Query(None, description="开始日期"),
-    end_date: Optional[datetime] = Query(None, description="结束日期"),
+    start_date: Optional[datetime] = Query(None, description="开始日期（按处理时间）"),
+    end_date: Optional[datetime] = Query(None, description="结束日期（按处理时间）"),
+    include_voided: bool = Query(False, description="是否包含已更正作废的历史记录"),
     db: Session = Depends(get_db)
 ):
-    """获取讲解员积分记录"""
+    """获取讲解员积分记录（含业务归属月、作废/更正审计信息）"""
     staff = crud.get_staff(db, staff_id)
     if not staff:
         raise HTTPException(status_code=404, detail="人员不存在")
-    records = crud.get_point_records(db, staff_id=staff_id, start_date=start_date, end_date=end_date, skip=skip, limit=limit)
+    records = crud.get_point_records(
+        db, staff_id=staff_id, start_date=start_date, end_date=end_date,
+        include_voided=include_voided, skip=skip, limit=limit
+    )
     result = []
     for r in records:
         result.append(schemas.PointRecord(
@@ -159,6 +163,14 @@ def get_staff_points(
             description=r.description,
             session_title=r.session.title if r.session else None,
             level_badge_name=r.level_badge.badge_name if r.level_badge else None,
+            service_year=r.service_year,
+            service_month=r.service_month,
+            fact_key=r.fact_key,
+            replaces_id=r.replaces_id,
+            is_voided=r.is_voided,
+            voided_at=r.voided_at,
+            void_reason=r.void_reason,
+            operator=r.operator,
             created_at=r.created_at
         ))
     return result
@@ -194,11 +206,13 @@ def adjust_staff_points(
     description: str = Query(..., description="调整原因"),
     db: Session = Depends(get_db)
 ):
-    """人工调整讲解员积分"""
+    """人工调整讲解员积分（即时积分，按处理时间归属）"""
     from app.models import PointSourceType
     try:
-        source_type_enum = PointSourceType(source_type)
-    except ValueError:
+        # 同时接受枚举名（BONUS/DEDUCTION）和中文值（额外奖励/积分扣除）
+        source_type_enum = PointSourceType[source_type] if source_type in PointSourceType.__members__ \
+            else PointSourceType(source_type)
+    except (ValueError, KeyError):
         raise HTTPException(status_code=400, detail="无效的积分类型")
     result = crud.adjust_staff_points(db, staff_id, points, source_type_enum, description)
     if not result.success:
